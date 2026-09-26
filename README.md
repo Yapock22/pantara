@@ -57,17 +57,65 @@ print(f"Precision ±5% : {precision_5pct * 100:.1f}%")
 print(f"Blocks chosen : {chosen_blocks}")
 ```
 
-## Scikit-learn interface
+## fit / predict on held-out data
 
-Pantara ships a scikit-learn–compatible estimator usable in any `fit` / `predict` workflow:
+`PantaraRegressor` runs the same matching pursuit as `pipeline()` and stores every chosen block (family, space, fitted parameters), so the learned law can be applied to new data without `y`:
 
 ```python
-from pantara.sklearn_wrapper import PantaraRegressor
+from pantara import PantaraRegressor
 
-est = PantaraRegressor(max_time=3600, random_state=42)
-est.fit(X_train, y_train)
-y_pred = est.predict(X_test)
+est = PantaraRegressor(random_state=42)
+est.fit(X_train, y_train, feature_names=["m", "r"])
+y_pred = est.predict(X_test)          # ValueError if fit() was not called
+
+print(est.expression())               # 3 × m^1.00 × r^-2.00
+print(est.chosen_)                    # ['power_law[log_log_lstsq]']
+print(est.score(X_test, y_test))      # R² on held-out data
 ```
+
+Stored blocks are replayed exactly: power laws via their lstsq coefficients, trig blocks via `A·sin/cos(ω·x + φ) + C`, linear blocks via their Adam weights and normalisation constants. If `X_test` falls outside a block's domain (e.g. a value ≤ 0 for a power-law or log block), the affected predictions are `NaN` and a `RuntimeWarning` is emitted.
+
+## Command line
+
+Installing the package provides a `pantara` command (also available as `python -m pantara`):
+
+```bash
+# Discover the law and print a report
+pantara run capteurs.csv --target force
+pantara run capteurs.csv --target force --features displacement,velocity
+pantara run capteurs.csv --target force --task regression
+
+# Learn once, predict later
+pantara fit historique.csv --target force --save modele.pkl
+pantara predict mesures.csv --model modele.pkl --output predictions.csv
+```
+
+```
+Pantara v7d — Découverte automatique de lois physiques
+======================================================
+Fichier     : capteurs.csv
+Tâche       : régression (détectée automatiquement)
+Points      : 500
+Features    : displacement, velocity (2)
+Cible       : force
+
+Analyse en cours...
+
+Loi détectée    : power_law
+Expression      : 3.42 × displacement^1.00 × velocity^-2.00
+R²              : 1.0000
+Précision ±5%   : 100.0%
+Temps           : 0.06s
+Confiance       : haute
+
+Blocs           : power_law[log_log_lstsq]
+```
+
+- **CSV loading:** separator (`,` `;` tab) and encoding (UTF-8, Windows-1252, Latin-1) are detected automatically; decimal commas are accepted in `;`-separated files. Column names may be given with or without their unit, and case or accents don't matter (`"Force (N)"`, `Force`, `force`).
+- **Cleaning:** rows with missing values are dropped; non-numeric columns are ignored unless they are the target. Warnings are printed below 30 points or above 8 features.
+- **Task detection:** a non-numeric target, ≤ 10 distinct values, or fewer than 5 % distinct values means classification. Classification is not implemented yet, so the command says so and exits. Use `--task regression` to override.
+- **predict** writes the input rows plus a `<target>_pred` column (to stdout by default). If the target column is present, it also reports the held-out R².
+- A saved model is a pickle of the fitted `PantaraRegressor`. Only load model files you trust.
 
 ## SRBench results
 
@@ -108,8 +156,10 @@ Trained on 15 000 synthetic episodes (300 points each), 22 law types, class-bala
 pantara/
 ├── pantara/
 │   ├── __init__.py     ← public API
-│   ├── core.py         ← full pipeline (physiqai_agent_v7d.py)
+│   ├── core.py         ← full pipeline (physiqai_agent_v7d.py) + PantaraRegressor
+│   ├── cli.py          ← `pantara` command line
 │   └── model.pt        ← pre-trained oracle weights (532 KB)
+├── tests/              ← pytest suite (python -m pytest tests)
 ├── setup.py
 ├── requirements.txt
 └── README.md
