@@ -1353,6 +1353,542 @@ def evaluate_all(model, n_runs=20, N=500):
         p,blocs=pipeline(model,X,y,verbose=True)
         print(f"  Précision={p*100:.1f}%  blocs={blocs}")
 
+# ─────────────────────────────────────────────
+# ESTIMATEUR fit / predict HORS-ÉCHANTILLON
+# Porté depuis le wrapper SRBench (experiment/methods/pantara/regressor.py)
+#
+# fit()     rejoue pipeline() pas à pas (mêmes choix, mêmes poids Adam)
+#           et mémorise une « recette » par bloc retenu.
+# predict() réapplique les recettes sur X_new, sans y.
+#
+# Les fonctions du pipeline ci-dessus ne sont pas modifiées : les deux
+# copies de fit_block_* plus bas renvoient en plus les poids appris.
+# ─────────────────────────────────────────────
+import os
+import warnings
+
+_DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model.pt')
+
+def _transform_x(X_np, space):
+    """
+    Partie X de transform_space, sans y.
+    Fix SRBench : rejouer via transform_space(X, np.zeros(N), space) faisait
+    échouer les espaces log (valid=False) → bloc silencieusement nul.
+    """
+    eps = 1e-10
+    if space in ('log_x', 'log_log', 'log_log_multi'):
+        return np.log(X_np + eps)
+    if space == 'inv_x':
+        return 1.0/(X_np + eps)
+    return X_np
+
+def _feature_col(kind, idx, param, X_t):
+    """Colonne d'un bloc 1D — mêmes expressions que best_per_family_multispace."""
+    if kind == 'lin':    return X_t[:,idx[0]].copy()
+    if kind == 'sq':     return X_t[:,idx[0]]**2
+    if kind == 'pair':   return X_t[:,idx[0]]*X_t[:,idx[1]]
+    if kind == 'qc':     return X_t[:,idx[0]]*X_t[:,idx[1]]**2
+    if kind == 'trip':   return X_t[:,idx[0]]*X_t[:,idx[1]]*X_t[:,idx[2]]
+    if kind == 'qinv':   return X_t[:,idx[0]]**2/X_t[:,idx[1]]
+    # log_log_multi : colonnes calculées en espace original (best_multivar_loglog)
+    if kind == 'm_pow':  return np.sign(X_t[:,idx[0]])*np.abs(X_t[:,idx[0]])**param
+    if kind == 'm_ratio':return X_t[:,idx[0]]*X_t[:,idx[1]]/X_t[:,idx[2]]**2
+    raise ValueError(f"type de colonne inconnu : {kind}")
+
+def _feature_candidates(fam, space, X_np, resid_np):
+    """Énumère les (kind, idx, param) que best_per_family_multispace peut produire."""
+    D = X_np.shape[1]
+    if space == 'log_log_multi':
+        eps = 1e-10
+        log_X   = np.log(X_np + eps)
+        log_res = np.log(np.abs(resid_np) + eps)
+        for j in range(D):
+            cov = np.cov(log_X[:,j], log_res)
+            if cov[0,0] < 1e-10: continue
+            yield 'm_pow', (j,), cov[0,1]/cov[0,0]
+        for j in range(D):
+            for k in range(j+1, D):
+                yield 'pair', (j,k), None
+        for j in range(D):
+            for k in range(j+1, D):
+                for l in range(D):
+                    if l not in (j,k): yield 'm_ratio', (j,k,l), None
+        for j in range(D):
+            for k in range(j+1, D):
+                for l in range(k+1, D):
+                    yield 'trip', (j,k,l), None
+        return
+    if fam in ('lin', 'sq'):
+        for j in range(D): yield fam, (j,), None
+    elif fam == 'pair':
+        for j in range(D):
+            for k in range(j+1, D): yield fam, (j,k), None
+    elif fam in ('qc', 'qinv'):
+        for j in range(D):
+            for k in range(D):
+                if j != k: yield fam, (j,k), None
+    elif fam == 'trip':
+        for j in range(D):
+            for k in range(j+1, D):
+                for l in range(k+1, D): yield fam, (j,k,l), None
+
+def _locate_feature(fam, space, col, X_np, resid_np):
+    """Retrouve la combinaison de variables qui a produit `col` au fit."""
+    X_t = X_np if space == 'log_log_multi' else _transform_x(X_np, space)
+    best = None; best_err = float('inf')
+    with np.errstate(all='ignore'):
+        for kind, idx, param in _feature_candidates(fam, space, X_np, resid_np):
+            cand = _feature_col(kind, idx, param, X_t)
+            if np.array_equal(cand, col):
+                return kind, idx, param
+            err = float(np.nanmax(np.abs(cand - col))) if np.all(np.isfinite(cand)) else float('inf')
+            if err < best_err:
+                best, best_err = (kind, idx, param), err
+    if best is not None and best_err <= 1e-9*(np.abs(col).max() + 1e-30):
+        return best
+    raise RuntimeError(f"bloc {fam}[{space}] non rejouable : colonne introuvable")
+
+def _fit_block_1d_params(col_t, resid_t, space, resid_orig, steps=500, lr=0.02):
+    """fit_block_1d à l'identique, qui renvoie aussi (w, b) et la normalisation."""
+    mn_c=np.median(col_t); iqr_c=np.percentile(col_t,75)-np.percentile(col_t,25)+1e-10
+    mn_r=np.median(resid_t); iqr_r=np.percentile(resid_t,75)-np.percentile(resid_t,25)+1e-10
+    col_n=(col_t-mn_c)/iqr_c; resid_n=(resid_t-mn_r)/iqr_r
+    ct=torch.tensor(col_n,  dtype=torch.float32,device=DEVICE)
+    rt=torch.tensor(resid_n,dtype=torch.float32,device=DEVICE)
+    w=torch.zeros(1,requires_grad=True,device=DEVICE)
+    b=torch.zeros(1,requires_grad=True,device=DEVICE)
+    opt=optim.Adam([w,b],lr=lr)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss=((w*ct+b-rt)**2).mean()
+        loss.backward(); opt.step()
+    with torch.no_grad():
+        pred_n=(w*ct+b).cpu().numpy()
+        pred_t=pred_n*iqr_r+mn_r
+    pred_orig=inverse_transform_y(pred_t,space)
+    new_resid_orig=resid_orig-pred_orig
+    params={'mn_c':float(mn_c),'iqr_c':float(iqr_c),
+            'mn_r':float(mn_r),'iqr_r':float(iqr_r),
+            'w':float(w.item()),'b':float(b.item())}
+    return new_resid_orig, pred_orig, params
+
+def _fit_block_multi_params(X_t, resid_t, space, resid_orig, steps=500, lr=0.02):
+    """fit_block_multifeature à l'identique, qui renvoie aussi (W, b) et la normalisation."""
+    N, D = X_t.shape
+    X_std=np.zeros_like(X_t); mu_x=np.zeros(D); s_x=np.ones(D)
+    for j in range(D):
+        mu_x[j]=X_t[:,j].mean(); s_x[j]=X_t[:,j].std()+1e-10
+        X_std[:,j]=(X_t[:,j]-mu_x[j])/s_x[j]
+    mu_r=resid_t.mean(); s_r=resid_t.std()+1e-10
+    resid_std=(resid_t-mu_r)/s_r
+    Xt=torch.tensor(X_std,  dtype=torch.float32,device=DEVICE)
+    Rt=torch.tensor(resid_std,dtype=torch.float32,device=DEVICE)
+    W=torch.zeros(D,requires_grad=True,device=DEVICE)
+    b=torch.zeros(1,requires_grad=True,device=DEVICE)
+    opt=optim.Adam([W,b],lr=lr)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss=((Xt@W+b-Rt)**2).mean()
+        loss.backward(); opt.step()
+    with torch.no_grad():
+        pred_std=(Xt@W+b).cpu().numpy()
+        pred_t=pred_std*s_r+mu_r
+    if space == 'log_log_multi':
+        pred_orig = np.exp(pred_t)
+        pred_orig = np.where(np.abs(pred_orig) < 1e-30, 1e-30, pred_orig)
+    else:
+        pred_orig = inverse_transform_y(pred_t, space)
+    new_resid_orig = resid_orig - pred_orig
+    params={'mu_x':mu_x.copy(),'s_x':s_x.copy(),
+            'mu_r':float(mu_r),'s_r':float(s_r),
+            'W':W.detach().cpu().numpy().astype(np.float64),
+            'b':float(b.item())}
+    return new_resid_orig, pred_orig, params
+
+# ─── Replay des blocs sur X_new ───
+def _predict_power_law(blk, X):
+    """y = C · Π xj^nj   (coeffs = [log C, n1, n2, ...])"""
+    A = np.column_stack([np.ones(len(X)), np.log(X)])
+    return np.exp(A @ blk['coeffs'])
+
+def _predict_trig(blk, X):
+    """y = A·sin/cos(ω·x + φ) [+ B·x] + C"""
+    form = blk['form']
+    if form is None:  # fit_trig n'a trouvé aucune fréquence : bloc nul
+        return np.zeros(len(X))
+    x = X[:, blk['j_var']]
+    wave = np.sin if form.startswith('sin') else np.cos
+    pred = blk['A']*wave(blk['omega']*x + blk['phi']) + blk['C']
+    if form.endswith('+lin'):
+        pred = pred + blk['B']*x
+    return pred
+
+def _predict_1d_linear(blk, X):
+    space = blk['space']
+    X_t = X if blk['kind'].startswith('m_') or space == 'log_log_multi' else _transform_x(X, space)
+    col = _feature_col(blk['kind'], blk['indices'], blk['param'], X_t)
+    col_n  = (col - blk['mn_c'])/blk['iqr_c']
+    pred_t = (blk['w']*col_n + blk['b'])*blk['iqr_r'] + blk['mn_r']
+    return inverse_transform_y(pred_t, space)
+
+def _predict_multi_linear(blk, X):
+    space = blk['space']
+    X_t = _transform_x(X, space)
+    pred_t = ((X_t - blk['mu_x'])/blk['s_x']) @ blk['W'] + blk['b']
+    pred_t = pred_t*blk['s_r'] + blk['mu_r']
+    if space == 'log_log_multi':
+        pred = np.exp(pred_t)
+        return np.where(np.abs(pred) < 1e-30, 1e-30, pred)
+    return inverse_transform_y(pred_t, space)
+
+_PREDICTORS = {
+    'power_law':    _predict_power_law,
+    'trig':         _predict_trig,
+    '1d_linear':    _predict_1d_linear,
+    'multi_linear': _predict_multi_linear,
+}
+
+# ─── Rendu texte des blocs ───
+def _fmt(v):
+    return f"{v:.4g}"
+
+def _affine_str(terms, c):
+    """'a × t1 + b × t2 − c' ; terms = [(coef, texte)]."""
+    out = ''
+    for coef, txt in terms:
+        if not out:
+            out = f"{_fmt(coef)} × {txt}"
+        else:
+            out += f" {'−' if coef < 0 else '+'} {_fmt(abs(coef))} × {txt}"
+    if abs(c) > 0:
+        out = f"{out} {'−' if c < 0 else '+'} {_fmt(abs(c))}" if out else _fmt(c)
+    return out or '0'
+
+def _wrap_inverse_y(expr, space):
+    if space in ('log_y', 'log_log'): return f"exp({expr})"
+    if space == 'sq_y':               return f"√|{expr}|"
+    return expr
+
+def _xt_str(name, space):
+    if space in ('log_x', 'log_log', 'log_log_multi'): return f"ln({name})"
+    if space == 'inv_x': return f"(1/{name})"
+    return name
+
+def _block_str(blk, names):
+    t = blk['type']
+    if t == 'power_law':
+        c = blk['coeffs']
+        parts = [_fmt(math.exp(c[0]))] + [f"{names[j]}^{n:.2f}" for j, n in enumerate(c[1:])]
+        return ' × '.join(parts)
+    if t == 'trig':
+        if blk['form'] is None: return '0'
+        x = names[blk['j_var']]
+        wave = 'sin' if blk['form'].startswith('sin') else 'cos'
+        terms = [(blk['A'], f"{wave}({_fmt(blk['omega'])} × {x} {'−' if blk['phi'] < 0 else '+'} {_fmt(abs(blk['phi']))})")]
+        if blk['form'].endswith('+lin'):
+            terms.append((blk['B'], x))
+        return _affine_str(terms, blk['C'])
+    if t == '1d_linear':
+        kind, idx, space = blk['kind'], blk['indices'], blk['space']
+        if kind.startswith('m_') or space == 'log_log_multi':
+            v = [names[j] for j in idx]
+        else:
+            v = [_xt_str(names[j], space) for j in idx]
+        col = {
+            'lin':  lambda: v[0],
+            'sq':   lambda: f"{v[0]}^2",
+            'pair': lambda: f"{v[0]} × {v[1]}",
+            'qc':   lambda: f"{v[0]} × {v[1]}^2",
+            'trip': lambda: f"{v[0]} × {v[1]} × {v[2]}",
+            'qinv': lambda: f"{v[0]}^2 / {v[1]}",
+            'm_pow':   lambda: f"{v[0]}^{blk['param']:.2f}",
+            'm_ratio': lambda: f"{v[0]} × {v[1]} / {v[2]}^2",
+        }[kind]()
+        a = blk['w']*blk['iqr_r']/blk['iqr_c']
+        c = blk['mn_r'] + blk['iqr_r']*(blk['b'] - blk['w']*blk['mn_c']/blk['iqr_c'])
+        return _wrap_inverse_y(_affine_str([(a, col)], c), space)
+    if t == 'multi_linear':
+        space = blk['space']
+        a = blk['W']*blk['s_r']/blk['s_x']
+        c = blk['mu_r'] + blk['s_r']*(blk['b'] - float(np.sum(blk['W']*blk['mu_x']/blk['s_x'])))
+        if space in ('log_log', 'log_log_multi'):
+            # exp(c + Σ aj·ln xj) = e^c · Π xj^aj
+            return ' × '.join([_fmt(math.exp(c))] +
+                              [f"{names[j]}^{aj:.2f}" for j, aj in enumerate(a)])
+        terms = [(aj, _xt_str(names[j], space)) for j, aj in enumerate(a)]
+        return _wrap_inverse_y(_affine_str(terms, c), space)
+    return '?'
+
+class PantaraRegressor:
+    """
+    Pantara v7d avec interface fit / predict.
+
+    fit(X, y) rejoue pipeline() à l'identique (mêmes blocs choisis, mêmes
+    poids) et mémorise chaque bloc ; predict(X_new) les réapplique sans y.
+
+    Attributs après fit() :
+      blocks_         recettes des blocs (type, espace, paramètres)
+      chosen_         noms des blocs, identiques à ceux de pipeline()
+      precision_      précision ±5 % en échantillon (= pipeline())
+      r2_             R² en échantillon
+      feature_names_  noms des variables
+      n_features_in_  nombre de variables
+    """
+
+    def __init__(self, model=None, max_steps=5, n_candidates=4,
+                 min_score=MIN_SCORE, random_state=42):
+        self.model        = model  # oracle déjà chargé ; sinon model.pt
+        self.max_steps    = max_steps
+        self.n_candidates = n_candidates
+        self.min_score    = min_score
+        self.random_state = random_state
+
+    # ── helpers ──
+    def _oracle(self):
+        if self.model is not None:
+            return self.model
+        oracle = OracleClassifier(n_classes=N_CLASSES)
+        oracle.load_state_dict(torch.load(_DEFAULT_MODEL_PATH, weights_only=True,
+                                          map_location=DEVICE))
+        oracle.to(DEVICE)
+        oracle.eval()
+        return oracle
+
+    @staticmethod
+    def _as_2d(X):
+        X_np = np.asarray(X, dtype=np.float64)
+        if X_np.ndim == 1:
+            X_np = X_np.reshape(-1, 1)
+        if X_np.ndim != 2:
+            raise ValueError(f"X doit être 2D (N, D), reçu {X_np.shape}")
+        return X_np
+
+    # ── fit ──
+    def fit(self, X, y, feature_names=None):
+        if feature_names is None and hasattr(X, 'columns'):
+            feature_names = [str(c) for c in X.columns]
+        X_np = self._as_2d(X)
+        y_np = np.asarray(y, dtype=np.float64).ravel()
+        if len(X_np) != len(y_np):
+            raise ValueError(f"X et y n'ont pas le même nombre de points "
+                             f"({len(X_np)} ≠ {len(y_np)})")
+        if not (np.all(np.isfinite(X_np)) and np.all(np.isfinite(y_np))):
+            raise ValueError("X et y ne doivent contenir ni NaN ni infini")
+        D = X_np.shape[1]
+        if feature_names is None:
+            feature_names = [f'x{j}' for j in range(D)]
+        if len(feature_names) != D:
+            raise ValueError(f"{len(feature_names)} noms pour {D} variables")
+
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+            torch.manual_seed(self.random_state)
+        model = self._oracle()
+
+        # ── Boucle identique à pipeline(), avec mémorisation des blocs ──
+        resid_orig=y_np.copy(); acc=np.zeros_like(y_np); chosen=[]; blocks=[]
+
+        for step in range(self.max_steps):
+            ratio=resid_orig.std()/(y_np.std()+1e-10)
+            if ratio<0.06: break
+
+            scores,best_config,_=best_per_family_multispace(X_np,resid_orig,y_np)
+            stats  = make_state_stats(scores,resid_orig,y_np,X_np)
+            points = make_oracle_input(X_np,resid_orig,y_np,N_POINTS)
+            ranked,probs = model.predict_ranked(points, stats)
+
+            if np.all(X_np > 0) and np.all(resid_orig > 0):
+                pl_result = detect_and_fit_power_law(X_np, resid_orig)
+                if pl_result is not None:
+                    pred_pl, coeffs_pl, r2_pl = pl_result
+                    new_resid_pl = resid_orig - pred_pl
+                    quality_pl = power_law_bloc_score(resid_orig, new_resid_pl, y_np)
+                    if quality_pl > 0.30:
+                        acc += pred_pl
+                        resid_orig = new_resid_pl
+                        chosen.append('power_law[log_log_lstsq]')
+                        blocks.append({'type':'power_law',
+                                       'coeffs':np.asarray(coeffs_pl,dtype=np.float64).copy()})
+                        if quality_pl > 0.80: break
+                        continue
+
+            candidates=[]
+            actions_to_test = list(ranked[:self.n_candidates])
+            lin_action = FAMILIES.index('lin')
+            sc_lin, sp_lin, _, _, _ = best_config['lin']
+            if (sp_lin == 'original' and sc_lin >= 0.85
+                    and lin_action not in actions_to_test):
+                actions_to_test.append(lin_action)
+            pair_action = FAMILIES.index('pair')
+            sc_pair, sp_pair, _, _, _ = best_config['pair']
+            if (sp_pair == 'original' and sc_pair >= 0.85
+                    and pair_action not in actions_to_test):
+                actions_to_test.append(pair_action)
+
+            for action in actions_to_test:
+                if action>=len(FAMILIES): continue
+                fam=FAMILIES[action]
+                sc,sp,col,X_t,resid_t=best_config[fam]
+                if col is None: continue
+                if fam in ('sin', 'cos'):
+                    try:
+                        omega_init = float(sp.split('_w')[-1])
+                    except:
+                        omega_init = None
+                    try:
+                        j_var = int(sp.split('_x')[1].split('_')[0])
+                        x_var = X_np[:,j_var]
+                    except:
+                        j_var = 0
+                        x_var = X_np[:,0]
+                    new_resid, pred_orig, trig_info = fit_trig(
+                        x_var, resid_orig, y_np,
+                        omega_candidates=[omega_init] if omega_init else None,
+                        try_linear=False, steps=600)
+                    recipe = {'type':'trig','j_var':j_var,
+                              'form':trig_info.get('form'),
+                              'A':trig_info.get('A',0.0),'omega':trig_info.get('omega',0.0),
+                              'phi':trig_info.get('phi',0.0),'C':trig_info.get('C',0.0),
+                              'B':trig_info.get('B',0.0)}
+                else:
+                    # même aiguillage que fit_block()
+                    use_multi = (sp in ('log_log','log_x','log_y','log_log_multi') and
+                                 X_t is not None and X_t.ndim==2 and X_t.shape[1]>1)
+                    if use_multi:
+                        new_resid,pred_orig,params=_fit_block_multi_params(
+                            X_t,resid_t,sp,resid_orig)
+                        recipe = {'type':'multi_linear','family':fam,'space':sp,**params}
+                    else:
+                        new_resid,pred_orig,params=_fit_block_1d_params(
+                            col,resid_t,sp,resid_orig)
+                        # colonne localisée seulement si le bloc est retenu
+                        recipe = {'type':'1d_linear','family':fam,'space':sp,
+                                  '_col':col,'_resid':resid_orig,**params}
+                sc_after,_,_=best_per_family_multispace(X_np,new_resid,y_np)
+                quality=bloc_score(resid_orig,new_resid,y_np,sc_after)
+                clf_w=float(probs[action])/(float(probs[ranked[0]])+1e-10)
+                combined=quality*(0.6+0.4*clf_w)
+                sc_orig = 0.0
+                if fam in ('lin', 'pair', 'qc', 'qinv'):
+                    orig_sp  = best_config[fam][1]
+                    if orig_sp == 'original':
+                        sc_orig = sc
+                    else:
+                        for j in range(X_np.shape[1]):
+                            if fam == 'lin':
+                                c_orig = X_np[:,j]
+                            elif fam == 'sq':
+                                c_orig = X_np[:,j]**2
+                            else:
+                                c_orig = None
+                            if c_orig is not None:
+                                s_o = abs(corr_np(standardize(c_orig),
+                                                  standardize(resid_orig)))
+                                if s_o > sc_orig: sc_orig = s_o
+                if sp == 'original' and sc >= 0.97:
+                    combined = combined * 1.5
+                elif fam == 'lin' and sc_orig >= 0.85:
+                    combined = combined * 1.3
+                elif fam == 'pair' and sc_orig >= 0.85:
+                    combined = combined * 1.2
+                candidates.append({'family':fam,'space':sp,'quality':quality,
+                                   'combined':combined,'new_resid':new_resid,
+                                   'pred':pred_orig,'recipe':recipe})
+
+            if not candidates: break
+            best=max(candidates,key=lambda c:c['combined'])
+            if best['combined']<self.min_score: break
+
+            recipe = best['recipe']
+            if recipe['type'] == '1d_linear':
+                kind, idx, param = _locate_feature(
+                    recipe['family'], recipe['space'],
+                    recipe.pop('_col'), X_np, recipe.pop('_resid'))
+                recipe.update(kind=kind, indices=idx,
+                              param=None if param is None else float(param))
+            acc+=best['pred']; resid_orig=best['new_resid']
+            chosen.append(f"{best['family']}[{best['space']}]")
+            blocks.append(recipe)
+            if best['quality'] > 0.80: break
+
+        self.blocks_         = blocks
+        self.chosen_         = chosen
+        self.feature_names_  = list(feature_names)
+        self.n_features_in_  = D
+        self.train_pred_     = acc
+        self.precision_      = float(np.mean(np.abs(acc-y_np)/(np.abs(y_np)+1e-8)<0.05))
+        self.r2_             = _r2(y_np, acc)
+        return self
+
+    # ── predict ──
+    def predict(self, X_new):
+        if not hasattr(self, 'blocks_'):
+            raise ValueError("PantaraRegressor non entraîné : appeler fit(X, y) "
+                             "avant predict(X_new).")
+        X_np = self._as_2d(X_new)
+        if X_np.shape[1] != self.n_features_in_:
+            raise ValueError(f"X_new a {X_np.shape[1]} variable(s), le modèle a été "
+                             f"entraîné sur {self.n_features_in_} "
+                             f"({', '.join(self.feature_names_)})")
+        acc = np.zeros(len(X_np))
+        with np.errstate(all='ignore'):
+            for blk in self.blocks_:
+                acc += _PREDICTORS[blk['type']](blk, X_np)
+        n_bad = int(np.sum(~np.isfinite(acc)))
+        if n_bad:
+            warnings.warn(f"{n_bad} prédiction(s) non finie(s) : X_new sort du domaine "
+                          f"des blocs (ex. valeur ≤ 0 pour un bloc log ou power_law)",
+                          RuntimeWarning, stacklevel=2)
+        return acc
+
+    def score(self, X, y):
+        """R² de predict(X) par rapport à y."""
+        return _r2(np.asarray(y, dtype=np.float64).ravel(), self.predict(X))
+
+    def expression(self, feature_names=None):
+        """Loi apprise sous forme lisible, ex. '3.42 × x0^1.00 × x1^-2.00'."""
+        if not hasattr(self, 'blocks_'):
+            raise ValueError("PantaraRegressor non entraîné : appeler fit(X, y) d'abord.")
+        names = list(feature_names or self.feature_names_)
+        if not self.blocks_:
+            return '0'
+        out = ''
+        for b in self.blocks_:
+            s = _block_str(b, names)
+            if not out:
+                out = s
+            elif s.startswith('-'):
+                out += ' − ' + s[1:]
+            else:
+                out += ' + ' + s
+        return out
+
+    # ── sklearn / pickle ──
+    def get_params(self, deep=True):
+        return {'model': self.model, 'max_steps': self.max_steps,
+                'n_candidates': self.n_candidates, 'min_score': self.min_score,
+                'random_state': self.random_state}
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+    def __getstate__(self):
+        # L'oracle n'est pas sérialisé (poids liés au device) : predict() n'en
+        # a pas besoin, et un nouveau fit() le recharge depuis model.pt.
+        state = self.__dict__.copy()
+        state['model'] = None
+        return state
+
+    def __repr__(self):
+        return f"PantaraRegressor(blocks={getattr(self, 'chosen_', None)})"
+
+def _r2(y_true, y_pred):
+    ss_res = float(np.sum((y_true - y_pred)**2))
+    ss_tot = float(np.sum((y_true - y_true.mean())**2))
+    return 1.0 - ss_res/ss_tot if ss_tot > 0 else float('nan')
+
 if __name__=="__main__":
     print("=" * 68)
     print("  PhysiqAI v7d - Power Law analytique + Trig + Fixes")
